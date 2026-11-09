@@ -6,14 +6,13 @@ on:
 permissions:
   contents: read
 
-# Use only a Windows machine you own/manage, registered as a self-hosted runner
-# with labels: self-hosted, Windows, X64.
+# Runs on a temporary GitHub-hosted Windows VM; it is not your personal PC.
 # Required repository secrets: RDP_PASSWORD and TS_AUTHKEY.
 # Optional repository variable: RDP_USERNAME (default: rdpuser).
 
 jobs:
   configure-rdp:
-    runs-on: [self-hosted, Windows, X64]
+    runs-on: windows-latest
     timeout-minutes: 20
     env:
       RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
