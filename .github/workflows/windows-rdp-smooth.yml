@@ -1,0 +1,97 @@
+name: Windows RDP Smooth
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Use only a Windows machine you own/manage, registered as a self-hosted runner
+# with labels: self-hosted, Windows, X64.
+# Required repository secrets: RDP_PASSWORD and TS_AUTHKEY.
+# Optional repository variable: RDP_USERNAME (default: rdpuser).
+
+jobs:
+  configure-rdp:
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 20
+    env:
+      RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+      TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+      RDP_USERNAME: ${{ vars.RDP_USERNAME || 'rdpuser' }}
+
+    steps:
+      - name: Validate runner and secrets
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:RDP_PASSWORD) { throw 'Missing repository secret: RDP_PASSWORD' }
+          if (-not $env:TS_AUTHKEY) { throw 'Missing repository secret: TS_AUTHKEY' }
+          $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+          $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+          if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+            throw 'The self-hosted runner service must run with administrator privileges.'
+          }
+          if ($env:RDP_USERNAME -notmatch '^[A-Za-z0-9._-]{1,20}$') {
+            throw 'RDP_USERNAME must be 1-20 characters: letters, digits, dot, underscore or hyphen.'
+          }
+          Write-Host "Runner: $env:COMPUTERNAME"
+          Get-ComputerInfo | Select-Object WindowsProductName, WindowsVersion, OsArchitecture
+
+      - name: Configure a dedicated local RDP account
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $secure = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          $account = Get-LocalUser -Name $env:RDP_USERNAME -ErrorAction SilentlyContinue
+          if ($account) {
+            Set-LocalUser -Name $env:RDP_USERNAME -Password $secure
+            Enable-LocalUser -Name $env:RDP_USERNAME
+          } else {
+            New-LocalUser -Name $env:RDP_USERNAME -Password $secure -AccountNeverExpires -PasswordNeverExpires -Description 'Dedicated remote desktop account' | Out-Null
+          }
+          Add-LocalGroupMember -Group 'Remote Desktop Users' -Member $env:RDP_USERNAME -ErrorAction SilentlyContinue
+
+          # Enable RDP and retain Network Level Authentication.
+          $ts = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server'
+          Set-ItemProperty -Path $ts -Name fDenyTSConnections -Type DWord -Value 0
+          $rdpTcp = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
+          Set-ItemProperty -Path $rdpTcp -Name UserAuthentication -Type DWord -Value 1
+          Set-ItemProperty -Path $rdpTcp -Name SecurityLayer -Type DWord -Value 2
+          Set-ItemProperty -Path $rdpTcp -Name MinEncryptionLevel -Type DWord -Value 3
+
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service -Name TermService
+          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue
+          if (-not (Get-NetFirewallRule -DisplayName 'RDP-TCP-3389 (managed)' -ErrorAction SilentlyContinue)) {
+            New-NetFirewallRule -DisplayName 'RDP-TCP-3389 (managed)' -Direction Inbound -Protocol TCP -LocalPort 3389 -Action Allow -Profile Domain,Private | Out-Null
+          }
+          $listener = Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue
+          if (-not $listener) { throw 'RDP is enabled but TCP port 3389 is not listening.' }
+          Write-Host "RDP account configured: $env:RDP_USERNAME"
+          Write-Host 'Network Level Authentication remains enabled.'
+
+      - name: Install and connect Tailscale
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = Join-Path $env:RUNNER_TEMP 'tailscale-setup.exe'
+          Invoke-WebRequest 'https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe' -OutFile $installer
+          Start-Process -FilePath $installer -ArgumentList '/quiet' -Wait
+          $ts = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
+          if (-not (Test-Path $ts)) { throw 'Tailscale installation failed: executable not found.' }
+
+          & $ts up "--auth-key=$env:TS_AUTHKEY" "--hostname=$($env:COMPUTERNAME.ToLower())" --accept-dns=false
+          if ($LASTEXITCODE -ne 0) { throw "tailscale up failed with exit code $LASTEXITCODE" }
+          Start-Sleep -Seconds 3
+          $ip = (& $ts ip -4 | Select-Object -First 1).Trim()
+          if (-not $ip) { throw 'Tailscale did not report an IPv4 address.' }
+
+          "## Windows RDP is configured" | Add-Content $env:GITHUB_STEP_SUMMARY
+          "" | Add-Content $env:GITHUB_STEP_SUMMARY
+          ("- **Host:** {0}:3389" -f $ip) | Add-Content $env:GITHUB_STEP_SUMMARY
+          ("- **Username:** {0}" -f $env:RDP_USERNAME) | Add-Content $env:GITHUB_STEP_SUMMARY
+          "- **Transport:** Tailscale private network" | Add-Content $env:GITHUB_STEP_SUMMARY
+          "- **NLA:** enabled" | Add-Content $env:GITHUB_STEP_SUMMARY
+          Write-Host "Tailscale IPv4: $ip"
+          Write-Host 'Setup complete. The Windows machine remains available while powered on and connected; this workflow does not keep an Actions job running.'
